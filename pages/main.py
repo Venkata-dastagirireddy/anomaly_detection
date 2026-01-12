@@ -1,89 +1,617 @@
 import streamlit as st
-
+st.set_page_config(
+        page_title="Anomaly Detection", 
+        layout="wide",
+        page_icon=":material/area_chart:",
+        initial_sidebar_state="collapsed")
+import pandas as pd
+import math
 from backend.data.data_handler import (
     load_dataset,
     get_data_quality_report,
     basic_data_cleaning,
+    get_columns,
+    get_column_dtypes,
+    get_allowed_conversions,
+    change_column_dtype,
+    drop_columns,
+    impute_column,
+    prepare_time_series_data,
 )
+from backend.anomaly_detection import detect_anomalies, get_anomaly_summary
+from backend.plots import (
+    plot_time_series_anomalies, plot_anomaly_distribution, plot_rolling_statistics,
+    plot_anomaly_heatmap, plot_before_after, plot_acf_pacf
+)
+
+
+# Utility: store history for undo
+def _push_history():
+    if "history" not in st.session_state:
+        st.session_state["history"] = []
+    # store copy of current working df
+    st.session_state["history"].append(st.session_state["working_df"].copy())
+
+
+def _undo_last():
+    if "history" in st.session_state and st.session_state["history"]:
+        st.session_state["working_df"] = st.session_state["history"].pop()
+        st.success("Reverted last operation")
+    else:
+        st.warning("Nothing to undo")
+
+
+def _reset_to_original():
+    st.session_state["working_df"] = st.session_state["original_df"].copy()
+    st.session_state["history"] = []
+    # Reset widget states
+    st.session_state["col_to_drop"] = []
+    st.session_state["drop_na_cols"] = []
+    st.toast("Reset to original uploaded data")
+    st.rerun()
+
+
+def _safe_set_working(df: pd.DataFrame, message: str = None):
+    _push_history()
+    st.session_state["working_df"] = df.copy()
+    if message:
+        st.success(message)
+
+
+# -----------------------------
+# Helper functions local to this page
+# -----------------------------
+def _normalize_dtype_simple(dtype_str: str) -> str:
+    s = dtype_str.lower()
+    if "int" in s and "uint" not in s:
+        return "int"
+    if "float" in s:
+        return "float"
+    if "bool" in s:
+        return "bool"
+    if "datetime" in s:
+        return "datetime"
+    if "category" in s:
+        return "category"
+    if "object" in s:
+        return "object"
+    return "str"
+
+
+def _choose_default_for_col(current_dtype_str: str, allowed_list: list):
+    curr = _normalize_dtype_simple(current_dtype_str)
+    if curr in allowed_list:
+        return curr
+    # fallback to first allowed
+    return allowed_list[0] if allowed_list else None
+
+
+def _methods_for_dtype(dtype_norm: str):
+    """
+    Provide list of imputation methods relevant for dtype.
+    """
+    # exhaustive set of sensible methods
+    numeric_methods = ["mean", "median", "mode", "constant", "ffill", "bfill", "interpolate", "percentile", "rolling_mean"]
+    str_methods = ["mode", "constant", "ffill", "bfill"]
+    bool_methods = ["mode", "constant", "ffill", "bfill"]
+    datetime_methods = ["ffill", "bfill", "constant"]
+    category_methods = ["mode", "constant", "ffill", "bfill"]
+
+    if dtype_norm in ("int", "float"):
+        return numeric_methods
+    if dtype_norm in ("str", "object"):
+        return str_methods
+    if dtype_norm == "bool":
+        return bool_methods
+    if dtype_norm == "datetime":
+        return datetime_methods
+    if dtype_norm == "category":
+        return category_methods
+    return ["mode", "constant"]
+
+
+def _default_impute_method(dtype_norm: str):
+    """
+    Default imputation rule (sensible defaults).
+    - numeric -> mean
+    - str/object -> mode
+    - bool -> mode
+    - datetime -> ffill
+    - category -> mode
+    """
+    if dtype_norm in ("int", "float"):
+        return "mean"
+    if dtype_norm in ("str", "object", "category"):
+        return "mode"
+    if dtype_norm == "bool":
+        return "mode"
+    if dtype_norm == "datetime":
+        return "ffill"
+    return "mode"
 
 
 def app():
     st.title("Anomaly Detection")
-    st.caption("Upload, inspect, and prepare your time series data")
+    st.caption("Upload, inspect, and prepare your time series data.")
+
+    st.divider()
+
+    with st.container(border=True):
+        uploaded_file = st.file_uploader(
+            "Upload Dataset",
+            type=["csv", "xlsx", "xls", "json", "parquet"],
+            help="Supported formats: CSV, Excel, JSON, Parquet",
+        )
+        if uploaded_file is None:
+            st.info("Please upload a dataset to proceed.")
+            return
+
+    # If first time upload (or new file), load and initialize session state
+    is_new_file = "uploaded_filename" not in st.session_state or st.session_state.get("uploaded_filename") != uploaded_file.name
+    if is_new_file:
+        try:
+            with st.spinner("Loading dataset..."):
+                df = load_dataset(uploaded_file)
+            st.session_state["uploaded_filename"] = uploaded_file.name
+            st.session_state["original_df"] = df.copy()
+            st.session_state["working_df"] = df.copy()
+            st.session_state["history"] = []
+            st.toast("Dataset loaded successfully", icon=":material/check_circle:")
+        except Exception as e:
+            st.error(f"Failed to load dataset: {e}")
+            return
+
+    # alias for convenience
+    df = st.session_state["working_df"]
+    original_df = st.session_state["original_df"]
+
+
+    left_col, right_col = st.columns([0.7, 0.3], gap="medium", border=True)
+    with left_col:
+        st.subheader(":material/data_table: Original Data Preview")
+
+        # Toggle full / paged display
+        show_full = st.checkbox("Show full data", value=False)
+        if show_full:
+            st.dataframe(original_df, use_container_width=True, hide_index=False)
+        else:
+            # show paged sample with pagination controls
+            preview_rows = st.number_input("Rows to preview", min_value=5, max_value=1000, value=100, step=5)
+            st.dataframe(original_df.head(int(preview_rows)), use_container_width=True, hide_index=False)
+
+    with right_col:
+        st.subheader(":material/summarize: Original Data Summary")
+        st.markdown(
+            f"**File:** `{st.session_state.get('uploaded_filename', '')}`"
+        )
+        report = get_data_quality_report(original_df)
+
+        col1, col2 = st.columns([1,1])
+        with col1:
+            st.metric("Rows", report["rows"])
+            st.metric("Missing Values", report["missing_values_total"])
+        with col2:
+            st.metric("Columns", report["columns"])
+            st.metric("Duplicates", report["duplicate_rows"])
+
+        with st.expander("Column types & counts"):
+            dtypes = get_column_dtypes(original_df)
+            dt_table = pd.DataFrame.from_dict(dtypes, orient="index", columns=["dtype"])
+            dt_table["missing"] = original_df.isnull().sum().astype(int)
+            dt_table["unique_values"] = original_df.nunique(dropna=True)
+            st.dataframe(dt_table, use_container_width=True, hide_index=False)
+
+        with st.expander("Descriptive statistics"):
+            try:
+                desc = original_df.describe(include="all").transpose()
+                # cast to string for stable display
+                st.dataframe(desc.astype(str), use_container_width=True)
+            except Exception as e:
+                st.write("Unable to compute describe():", e)
+
+    st.divider()
+
+    # Reset button at the top
+    if st.button("Reset to Original Dataset"):
+        _reset_to_original()
+
+    st.divider()
+
+    st.subheader(":material/view_column: Drop Unnecessary Columns")
+
+    with st.expander("Drop columns"):
+        st.write("**Select columns to drop:**")
+        
+        # Table header
+        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+        with col1:
+            st.write("**Column**")
+        with col2:
+            st.write("**Type**")
+        with col3:
+            st.write("**Missing**")
+        with col4:
+            st.write("**Drop?**")
+        
+        st.divider()
+        
+        # Collect selected columns
+        cols_to_drop = []
+        
+        # For each column, create a row
+        for col in get_columns(df):
+            dtype = str(df[col].dtype)
+            missing = int(df[col].isnull().sum())
+            
+            col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+            with col1:
+                st.write(f"**{col}**")
+            with col2:
+                st.write(dtype)
+            with col3:
+                st.write(missing)
+            with col4:
+                drop_this = st.checkbox(f"Drop {col}", key=f"drop_{col}", label_visibility="collapsed")
+                if drop_this:
+                    cols_to_drop.append(col)
+        
+        
+        st.divider()
+        
+        if st.button("Drop selected columns"):
+            if not cols_to_drop:
+                st.warning("No columns selected to drop")
+            else:
+                try:
+                    new_df = drop_columns(df, cols_to_drop)
+                    _safe_set_working(new_df, f"Dropped columns: {cols_to_drop}")
+                    st.rerun()  # Refresh the page to update all sections
+                except Exception as e:
+                    st.error(f"Failed to drop columns: {e}")
+
+    st.divider()
+
+    with st.expander(":material/view_list: Remove duplicate rows"):
+        duplicates = df.duplicated().sum()
+        st.write(f"**Number of duplicate rows:** {duplicates}")
+        if duplicates > 0:
+            keep_option = st.selectbox("Keep", ["first", "last"], key="keep_option")
+            if st.button("Remove duplicate rows"):
+                try:
+                    new_df = df.drop_duplicates(keep=keep_option)
+                    _safe_set_working(new_df, f"Removed {duplicates} duplicate rows")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+        else:
+            st.info("No duplicate rows found")
+
+    st.divider()
+
+    st.subheader(":material/data_table: Column Data Types (Change safely)")
+
+    # Use an expander to avoid huge UIs for wide tables
+    with st.expander("Change column data types"):
+        st.write("**Column Data Types:**")
+        
+        # Header for the table
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+        with col1:
+            st.write("**Column Name**")
+        with col2:
+            st.write("**Current Type**")
+        with col3:
+            st.write("**New Type**")
+        with col4:
+            st.write("**Action**")
+        
+        st.divider()
+        
+        # For each column, create a row
+        for col in get_columns(df):
+            current_dtype = str(df[col].dtype)
+            allowed = get_allowed_conversions(df, col)
+            default_choice = _choose_default_for_col(current_dtype, allowed)
+            
+            col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+            with col1:
+                st.write(f"**{col}**")
+            with col2:
+                st.write(f"`{current_dtype}`")
+            with col3:
+                if allowed:
+                    new_dtype = st.selectbox(
+                        f"New type for {col}",
+                        options=allowed,
+                        index=allowed.index(default_choice) if default_choice in allowed else 0,
+                        key=f"dtype_select_{col}",
+                        label_visibility="collapsed"
+                    )
+                else:
+                    st.write("No conversions")
+                    new_dtype = None
+            with col4:
+                if allowed and st.button(f"Update {col}", key=f"update_{col}"):
+                    if new_dtype != _normalize_dtype_simple(current_dtype):
+                        try:
+                            new_df, msg = change_column_dtype(st.session_state["working_df"], col, new_dtype)
+                            _safe_set_working(new_df, msg)
+                            st.rerun()  # To refresh the display
+                        except Exception as e:
+                            st.error(f"Failed: {e}")
+                    else:
+                        st.info("No change")
+        
+
+    st.divider()
+
+    st.subheader(":material/unknown_med: Missing Values — Options")
+
+    with st.expander("Impute / Remove missing values"):
+        cols_with_na = [c for c in get_columns(df) if int(df[c].isnull().sum()) > 0]
+        if not cols_with_na:
+            st.info("No missing values detected in the dataset")
+        else:
+            st.write("**Columns with Missing Values:**")
+            
+            # Table header
+            col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 2, 1])
+            with col1:
+                st.write("**Column**")
+            with col2:
+                st.write("**Missing**")
+            with col3:
+                st.write("**Method**")
+            with col4:
+                st.write("**Parameters**")
+            with col5:
+                st.write("**Action**")
+            
+            st.divider()
+            
+            # For each column with NA, create a row
+            for col in cols_with_na:
+                dtype_norm = _normalize_dtype_simple(str(df[col].dtype))
+                default_method = _default_impute_method(dtype_norm)
+                methods = _methods_for_dtype(dtype_norm)
+                missing_count = int(df[col].isnull().sum())
+                
+                col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 2, 1])
+                with col1:
+                    st.write(f"**{col}**")
+                with col2:
+                    st.write(missing_count)
+                with col3:
+                    method = st.selectbox(
+                        f"Method for {col}",
+                        options=methods,
+                        index=methods.index(default_method) if default_method in methods else 0,
+                        key=f"impute_method_{col}",
+                        label_visibility="collapsed"
+                    )
+                with col4:
+                    if method == "constant":
+                        param = st.text_input(f"Constant value for {col}", key=f"constant_{col}", label_visibility="collapsed")
+                    elif method == "percentile":
+                        param = st.slider(f"Percentile for {col}", 0.0, 100.0, 50.0, key=f"percentile_{col}", label_visibility="collapsed")
+                    elif method == "rolling_mean":
+                        param = st.number_input(f"Rolling window for {col}", min_value=1, max_value=1000, value=3, key=f"window_{col}", label_visibility="collapsed")
+                    else:
+                        param = None
+                        st.write("—")
+                with col5:
+                    if st.button(f"Impute {col}", key=f"impute_{col}"):
+                        try:
+                            const = param if method == "constant" else None
+                            pct = param if method == "percentile" else 50.0
+                            win = param if method == "rolling_mean" else 3
+                            new_df = impute_column(st.session_state["working_df"], col, method, constant_value=const, percentile=float(pct), window=int(win))
+                            _safe_set_working(new_df, f"Imputed {col} with {method}")
+                            st.rerun()  # Refresh to update missing values count
+                        except Exception as e:
+                            st.error(f"Failed to impute {col}: {e}")
+            
+            
+            st.divider()
+            
+            # Drop options
+            drop_selection = st.multiselect("Select columns for row/column dropping", options=cols_with_na, key="drop_na_cols")
+            if drop_selection:
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Drop rows with NA in selected columns"):
+                        try:
+                            _push_history()
+                            st.session_state["working_df"] = st.session_state["working_df"].dropna(subset=drop_selection)
+                            st.success("Dropped rows containing NA in selected columns")
+                            st.rerun()  # Refresh to update all sections
+                        except Exception as e:
+                            st.error(f"Failed to drop rows: {e}")
+                with c2:
+                    if st.button("Drop selected columns"):
+                        try:
+                            _push_history()
+                            st.session_state["working_df"] = st.session_state["working_df"].drop(columns=drop_selection)
+                            st.success("Dropped selected columns")
+                            st.rerun()  # Refresh to update all sections
+                        except Exception as e:
+                            st.error(f"Failed to drop columns: {e}")
+
+    st.divider()
+
+    # Final preview after operations
+    st.subheader(":material/dataset: Current Data Preview (After Operations)")
+    
+    final_left_col, final_right_col = st.columns([0.7, 0.3], gap="medium", border=True)
+    with final_left_col:
+        st.dataframe(st.session_state["working_df"].head(50), use_container_width=True)
+    
+    with final_right_col:
+        st.subheader(":material/summarize: Data Summary")
+        
+        report = get_data_quality_report(df)
+        col1, col2 = st.columns([1,1])
+        with col1:
+            st.metric("Rows", report["rows"])
+            st.metric("Missing Values", report["missing_values_total"])
+        with col2:
+            st.metric("Columns", report["columns"])
+            st.metric("Duplicates", report["duplicate_rows"])
+
+        with st.expander("Column types & counts"):
+            dtypes = get_column_dtypes(df)
+            dt_table = pd.DataFrame.from_dict(dtypes, orient="index", columns=["dtype"])
+            dt_table["missing"] = df.isnull().sum().astype(int)
+            dt_table["unique_values"] = df.nunique(dropna=True)
+            st.dataframe(dt_table, use_container_width=True, hide_index=False)
+
+        with st.expander("Descriptive statistics"):
+            try:
+                desc = df.describe(include="all").transpose()
+                # cast to string for stable display
+                st.dataframe(desc.astype(str), use_container_width=True)
+            except Exception as e:
+                st.write("Unable to compute describe():", e)
 
     st.divider()
 
     # -----------------------------
-    # File Upload
+    # Anomaly Detection
     # -----------------------------
-    uploaded_file = st.file_uploader(
-        "Upload Dataset",
-        type=["csv", "xlsx", "xls", "json", "parquet"],
-        help="Supported formats: CSV, Excel, JSON, Parquet",
-    )
+    st.subheader(":material/trending_up: Time Series Anomaly Detection")
 
-    if uploaded_file is None:
-        st.info("Please upload a dataset to proceed.")
-        return
+    with st.container(border=True):
+        # Column selection
+        col1, col2 = st.columns(2, border=True)
+        with col1:
+            date_col = st.selectbox(
+                "Select Date/Time Column",
+                options=get_columns(df),
+                help="Choose the column containing date/time data"
+            )
+        with col2:
+            value_col = st.selectbox(
+                "Select Value Column",
+                options=[c for c in get_columns(df) if pd.api.types.is_numeric_dtype(df[c])],
+                help="Choose the numeric column for anomaly detection"
+            )
 
-    # -----------------------------
-    # Load Dataset
-    # -----------------------------
-    try:
-        with st.spinner("Loading dataset..."):
-            raw_df = load_dataset(uploaded_file)
-
-            st.toast("Dataset loaded successfully", icon=":material/check:")
-
-    except Exception as e:
-        st.error(f"Failed to load dataset: {e}")
-        return
-
-    st.session_state["raw_df"] = raw_df
-
-    # -----------------------------
-    # Raw Data Preview
-    # -----------------------------
-    st.subheader("Raw Data Preview")
-    st.dataframe(raw_df, use_container_width=True, hide_index=True)
-
-    # -----------------------------
-    # Initial Data Checks
-    # -----------------------------
-    st.subheader("Initial Data Quality Check")
-
-    report = get_data_quality_report(raw_df)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", report["rows"])
-    c2.metric("Columns", report["columns"])
-    c3.metric("Duplicates", report["duplicate_rows"])
-    c4.metric("Missing Values", report["missing_values_total"])
-
-    with st.expander("Column Details"):
-        st.json(
-            {
-                "Data Types": report["dtypes"],
-                "Missing Values by Column": report["missing_values_by_column"],
-            }
+        # Algorithm selection
+        algorithm = st.selectbox(
+            "Select Anomaly Detection Algorithm",
+            options=["Z-Score", "IQR", "Isolation Forest", "One-Class SVM", "ARIMA", "Seasonal Decomposition"],
+            help="Choose the algorithm for detecting anomalies"
         )
 
-    # -----------------------------
-    # Initial Cleaning
-    # -----------------------------
-    st.subheader("Initial Cleaning")
+        # Algorithm-specific parameters
+        params = {}
+        if algorithm == "Z-Score":
+            params['threshold'] = st.slider("Z-Score Threshold", 1.0, 5.0, 3.0, 0.1)
+        elif algorithm == "IQR":
+            params['multiplier'] = st.slider("IQR Multiplier", 1.0, 3.0, 1.5, 0.1)
+        elif algorithm == "Isolation Forest":
+            params['contamination'] = st.slider("Contamination", 0.01, 0.5, 0.1, 0.01)
+        elif algorithm == "One-Class SVM":
+            params['nu'] = st.slider("Nu", 0.01, 0.5, 0.1, 0.01)
+        elif algorithm == "ARIMA":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                params['order'] = (st.number_input("ARIMA p", 0, 5, 1), st.number_input("ARIMA d", 0, 2, 1), st.number_input("ARIMA q", 0, 5, 1))
+            with col2:
+                params['arima_threshold'] = st.slider("Residual Threshold", 1.0, 5.0, 3.0, 0.1)
+            with col3:
+                st.write("ARIMA order: (p, d, q)")
+        elif algorithm == "Seasonal Decomposition":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                params['model_type'] = st.selectbox("Model", ["additive", "multiplicative"], index=0)
+            with col2:
+                params['period'] = st.number_input("Period", 2, 365, 7)
+            with col3:
+                params['sd_multiplier'] = st.slider("IQR Multiplier", 1.0, 3.0, 1.5, 0.1)
 
-    if st.button("Apply Basic Cleaning"):
-        with st.spinner("Applying basic cleaning..."):
-            cleaned_df = basic_data_cleaning(raw_df)
+        # Detect button
+        if st.button("Detect Anomalies", type="primary"):
+            try:
+                # Prepare data
+                with st.spinner("Preparing data..."):
+                    prepared_df, prep_msg = prepare_time_series_data(df, date_col, value_col)
+                st.success(prep_msg)
 
-        st.toast("Basic cleaning completed", icon=":material/check:")
+                # Detect anomalies
+                with st.spinner("Detecting anomalies..."):
+                    anomalies, detect_msg = detect_anomalies(prepared_df, value_col, algorithm, **params)
+                st.success(detect_msg)
 
-        st.session_state["cleaned_df"] = cleaned_df
+                # Summary
+                summary = get_anomaly_summary(anomalies)
+                st.subheader("Detection Summary")
+                col1, col2, col3, col4 = st.columns(4, border=True)
+                with col1:
+                    st.metric("Total Points", summary["total_points"])
+                with col2:
+                    st.metric("Anomalies", summary["anomaly_count"])
+                with col3:
+                    st.metric("Normal", summary["normal_count"])
+                with col4:
+                    st.metric("Anomaly %", f"{summary['anomaly_percentage']}%")
 
-        c1, c2 = st.columns(2)
-        c1.metric("Rows (Before)", raw_df.shape[0])
-        c2.metric("Rows (After)", cleaned_df.shape[0])
+                # Store results in session state
+                st.session_state['anomaly_prepared_df'] = prepared_df
+                st.session_state['anomaly_list'] = anomalies
+                st.session_state['anomaly_summary'] = summary
+                st.session_state['anomaly_date_col'] = date_col
+                st.session_state['anomaly_value_col'] = value_col
 
-        st.subheader("Cleaned Data Preview")
-        st.dataframe(cleaned_df.head(10), use_container_width=True)
+                # Option to add anomaly column
+                if st.button("Add Anomaly Column to Data"):
+                    new_df = df.copy()
+                    new_df['is_anomaly'] = anomalies
+                    _safe_set_working(new_df, "Added 'is_anomaly' column")
+                    st.success("Anomaly column added to dataset")
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Anomaly detection failed: {e}")
+
+    # Show plots if results exist
+    if 'anomaly_list' in st.session_state:
+        prepared_df = st.session_state['anomaly_prepared_df']
+        anomalies = st.session_state['anomaly_list']
+        summary = st.session_state['anomaly_summary']
+        date_col = st.session_state['anomaly_date_col']
+        value_col = st.session_state['anomaly_value_col']
+
+        # Plots
+        st.subheader("Visualization")
+        
+        # Main anomaly plot
+        with st.container(border=True):
+            fig_ts = plot_time_series_anomalies(prepared_df, date_col, value_col, anomalies)
+            st.plotly_chart(fig_ts, use_container_width=True)
+        
+        # Additional plots
+        with st.container(border=True):
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Distribution", "Rolling Stats", "Heatmap", "Before/After", "ACF/PACF"])
+        
+        with tab1:
+            fig_dist = plot_anomaly_distribution(anomalies)
+            st.plotly_chart(fig_dist, use_container_width=True)
+        
+        with tab2:
+            window = st.slider("Rolling Window", 3, 50, 7, key="rolling_window")
+            fig_roll = plot_rolling_statistics(prepared_df, date_col, value_col, window=window)
+            st.plotly_chart(fig_roll, use_container_width=True)
+        
+        with tab3:
+            fig_heat = plot_anomaly_heatmap(prepared_df, date_col, value_col, anomalies)
+            st.plotly_chart(fig_heat, use_container_width=True)
+        
+        with tab4:
+            fig_ba = plot_before_after(prepared_df, date_col, value_col, anomalies)
+            st.plotly_chart(fig_ba, use_container_width=True)
+        
+        with tab5:
+            lags = st.slider("Lags", 5, 50, 20, key="acf_lags")
+            fig_acf = plot_acf_pacf(prepared_df, value_col, lags=lags)
+            st.plotly_chart(fig_acf, use_container_width=True)
