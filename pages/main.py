@@ -16,6 +16,12 @@ from backend.data.data_handler import (
     change_column_dtype,
     drop_columns,
     impute_column,
+    prepare_time_series_data,
+)
+from backend.anomaly_detection import detect_anomalies, get_anomaly_summary
+from backend.plots import (
+    plot_time_series_anomalies, plot_anomaly_distribution, plot_rolling_statistics,
+    plot_anomaly_heatmap, plot_before_after, plot_acf_pacf
 )
 
 
@@ -50,6 +56,78 @@ def _safe_set_working(df: pd.DataFrame, message: str = None):
     st.session_state["working_df"] = df.copy()
     if message:
         st.success(message)
+
+
+# -----------------------------
+# Helper functions local to this page
+# -----------------------------
+def _normalize_dtype_simple(dtype_str: str) -> str:
+    s = dtype_str.lower()
+    if "int" in s and "uint" not in s:
+        return "int"
+    if "float" in s:
+        return "float"
+    if "bool" in s:
+        return "bool"
+    if "datetime" in s:
+        return "datetime"
+    if "category" in s:
+        return "category"
+    if "object" in s:
+        return "object"
+    return "str"
+
+
+def _choose_default_for_col(current_dtype_str: str, allowed_list: list):
+    curr = _normalize_dtype_simple(current_dtype_str)
+    if curr in allowed_list:
+        return curr
+    # fallback to first allowed
+    return allowed_list[0] if allowed_list else None
+
+
+def _methods_for_dtype(dtype_norm: str):
+    """
+    Provide list of imputation methods relevant for dtype.
+    """
+    # exhaustive set of sensible methods
+    numeric_methods = ["mean", "median", "mode", "constant", "ffill", "bfill", "interpolate", "percentile", "rolling_mean"]
+    str_methods = ["mode", "constant", "ffill", "bfill"]
+    bool_methods = ["mode", "constant", "ffill", "bfill"]
+    datetime_methods = ["ffill", "bfill", "constant"]
+    category_methods = ["mode", "constant", "ffill", "bfill"]
+
+    if dtype_norm in ("int", "float"):
+        return numeric_methods
+    if dtype_norm in ("str", "object"):
+        return str_methods
+    if dtype_norm == "bool":
+        return bool_methods
+    if dtype_norm == "datetime":
+        return datetime_methods
+    if dtype_norm == "category":
+        return category_methods
+    return ["mode", "constant"]
+
+
+def _default_impute_method(dtype_norm: str):
+    """
+    Default imputation rule (sensible defaults).
+    - numeric -> mean
+    - str/object -> mode
+    - bool -> mode
+    - datetime -> ffill
+    - category -> mode
+    """
+    if dtype_norm in ("int", "float"):
+        return "mean"
+    if dtype_norm in ("str", "object", "category"):
+        return "mode"
+    if dtype_norm == "bool":
+        return "mode"
+    if dtype_norm == "datetime":
+        return "ffill"
+    return "mode"
 
 
 def app():
@@ -395,71 +473,145 @@ def app():
             except Exception as e:
                 st.write("Unable to compute describe():", e)
 
+    st.divider()
 
-def _normalize_dtype_simple(dtype_str: str) -> str:
-    s = dtype_str.lower()
-    if "int" in s and "uint" not in s:
-        return "int"
-    if "float" in s:
-        return "float"
-    if "bool" in s:
-        return "bool"
-    if "datetime" in s:
-        return "datetime"
-    if "category" in s:
-        return "category"
-    if "object" in s:
-        return "object"
-    return "str"
+    # -----------------------------
+    # Anomaly Detection
+    # -----------------------------
+    st.subheader(":material/trending_up: Time Series Anomaly Detection")
 
+    with st.container(border=True):
+        # Column selection
+        col1, col2 = st.columns(2, border=True)
+        with col1:
+            date_col = st.selectbox(
+                "Select Date/Time Column",
+                options=get_columns(df),
+                help="Choose the column containing date/time data"
+            )
+        with col2:
+            value_col = st.selectbox(
+                "Select Value Column",
+                options=[c for c in get_columns(df) if pd.api.types.is_numeric_dtype(df[c])],
+                help="Choose the numeric column for anomaly detection"
+            )
 
-def _choose_default_for_col(current_dtype_str: str, allowed_list: list):
-    curr = _normalize_dtype_simple(current_dtype_str)
-    if curr in allowed_list:
-        return curr
-    # fallback to first allowed
-    return allowed_list[0] if allowed_list else None
+        # Algorithm selection
+        algorithm = st.selectbox(
+            "Select Anomaly Detection Algorithm",
+            options=["Z-Score", "IQR", "Isolation Forest", "One-Class SVM", "ARIMA", "Seasonal Decomposition"],
+            help="Choose the algorithm for detecting anomalies"
+        )
 
+        # Algorithm-specific parameters
+        params = {}
+        if algorithm == "Z-Score":
+            params['threshold'] = st.slider("Z-Score Threshold", 1.0, 5.0, 3.0, 0.1)
+        elif algorithm == "IQR":
+            params['multiplier'] = st.slider("IQR Multiplier", 1.0, 3.0, 1.5, 0.1)
+        elif algorithm == "Isolation Forest":
+            params['contamination'] = st.slider("Contamination", 0.01, 0.5, 0.1, 0.01)
+        elif algorithm == "One-Class SVM":
+            params['nu'] = st.slider("Nu", 0.01, 0.5, 0.1, 0.01)
+        elif algorithm == "ARIMA":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                params['order'] = (st.number_input("ARIMA p", 0, 5, 1), st.number_input("ARIMA d", 0, 2, 1), st.number_input("ARIMA q", 0, 5, 1))
+            with col2:
+                params['arima_threshold'] = st.slider("Residual Threshold", 1.0, 5.0, 3.0, 0.1)
+            with col3:
+                st.write("ARIMA order: (p, d, q)")
+        elif algorithm == "Seasonal Decomposition":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                params['model_type'] = st.selectbox("Model", ["additive", "multiplicative"], index=0)
+            with col2:
+                params['period'] = st.number_input("Period", 2, 365, 7)
+            with col3:
+                params['sd_multiplier'] = st.slider("IQR Multiplier", 1.0, 3.0, 1.5, 0.1)
 
-def _methods_for_dtype(dtype_norm: str):
-    """
-    Provide list of imputation methods relevant for dtype.
-    """
-    # exhaustive set of sensible methods
-    numeric_methods = ["mean", "median", "mode", "constant", "ffill", "bfill", "interpolate", "percentile", "rolling_mean"]
-    str_methods = ["mode", "constant", "ffill", "bfill"]
-    bool_methods = ["mode", "constant", "ffill", "bfill"]
-    datetime_methods = ["ffill", "bfill", "constant"]
-    category_methods = ["mode", "constant", "ffill", "bfill"]
+        # Detect button
+        if st.button("Detect Anomalies", type="primary"):
+            try:
+                # Prepare data
+                with st.spinner("Preparing data..."):
+                    prepared_df, prep_msg = prepare_time_series_data(df, date_col, value_col)
+                st.success(prep_msg)
 
-    if dtype_norm in ("int", "float"):
-        return numeric_methods
-    if dtype_norm in ("str", "object"):
-        return str_methods
-    if dtype_norm == "bool":
-        return bool_methods
-    if dtype_norm == "datetime":
-        return datetime_methods
-    if dtype_norm == "category":
-        return category_methods
-    return ["mode", "constant"]
+                # Detect anomalies
+                with st.spinner("Detecting anomalies..."):
+                    anomalies, detect_msg = detect_anomalies(prepared_df, value_col, algorithm, **params)
+                st.success(detect_msg)
 
+                # Summary
+                summary = get_anomaly_summary(anomalies)
+                st.subheader("Detection Summary")
+                col1, col2, col3, col4 = st.columns(4, border=True)
+                with col1:
+                    st.metric("Total Points", summary["total_points"])
+                with col2:
+                    st.metric("Anomalies", summary["anomaly_count"])
+                with col3:
+                    st.metric("Normal", summary["normal_count"])
+                with col4:
+                    st.metric("Anomaly %", f"{summary['anomaly_percentage']}%")
 
-def _default_impute_method(dtype_norm: str):
-    """
-    Default imputation rule (sensible defaults).
-    - numeric -> mean
-    - str/object -> mode
-    - bool -> mode
-    - datetime -> ffill
-    - category -> mode
-    """
-    if dtype_norm in ("int", "float"):
-        return "mean"
-    if dtype_norm in ("str", "object", "category"):
-        return "mode"
-    if dtype_norm == "bool":
-        return "mode"
-    if dtype_norm == "datetime":
-        return "ffill"
-    return "mode"
+                # Store results in session state
+                st.session_state['anomaly_prepared_df'] = prepared_df
+                st.session_state['anomaly_list'] = anomalies
+                st.session_state['anomaly_summary'] = summary
+                st.session_state['anomaly_date_col'] = date_col
+                st.session_state['anomaly_value_col'] = value_col
+
+                # Option to add anomaly column
+                if st.button("Add Anomaly Column to Data"):
+                    new_df = df.copy()
+                    new_df['is_anomaly'] = anomalies
+                    _safe_set_working(new_df, "Added 'is_anomaly' column")
+                    st.success("Anomaly column added to dataset")
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Anomaly detection failed: {e}")
+
+    # Show plots if results exist
+    if 'anomaly_list' in st.session_state:
+        prepared_df = st.session_state['anomaly_prepared_df']
+        anomalies = st.session_state['anomaly_list']
+        summary = st.session_state['anomaly_summary']
+        date_col = st.session_state['anomaly_date_col']
+        value_col = st.session_state['anomaly_value_col']
+
+        # Plots
+        st.subheader("Visualization")
+        
+        # Main anomaly plot
+        with st.container(border=True):
+            fig_ts = plot_time_series_anomalies(prepared_df, date_col, value_col, anomalies)
+            st.plotly_chart(fig_ts, use_container_width=True)
+        
+        # Additional plots
+        with st.container(border=True):
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Distribution", "Rolling Stats", "Heatmap", "Before/After", "ACF/PACF"])
+        
+        with tab1:
+            fig_dist = plot_anomaly_distribution(anomalies)
+            st.plotly_chart(fig_dist, use_container_width=True)
+        
+        with tab2:
+            window = st.slider("Rolling Window", 3, 50, 7, key="rolling_window")
+            fig_roll = plot_rolling_statistics(prepared_df, date_col, value_col, window=window)
+            st.plotly_chart(fig_roll, use_container_width=True)
+        
+        with tab3:
+            fig_heat = plot_anomaly_heatmap(prepared_df, date_col, value_col, anomalies)
+            st.plotly_chart(fig_heat, use_container_width=True)
+        
+        with tab4:
+            fig_ba = plot_before_after(prepared_df, date_col, value_col, anomalies)
+            st.plotly_chart(fig_ba, use_container_width=True)
+        
+        with tab5:
+            lags = st.slider("Lags", 5, 50, 20, key="acf_lags")
+            fig_acf = plot_acf_pacf(prepared_df, value_col, lags=lags)
+            st.plotly_chart(fig_acf, use_container_width=True)

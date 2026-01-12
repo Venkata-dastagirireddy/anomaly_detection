@@ -338,3 +338,37 @@ def impute_column(df: pd.DataFrame, column: str, method: str, constant_value: An
         raise ValueError(f"Unknown imputation method: {method}")
 
     return new_df
+
+
+# -----------------------------
+# Time Series Data Preparation
+# -----------------------------
+def prepare_time_series_data(df: pd.DataFrame, date_col: str, value_col: str) -> Tuple[pd.DataFrame, str]:
+    """
+    Prepare data for time series anomaly detection.
+    Ensures date column is datetime and sorts by date.
+    Returns (prepared_df, message)
+    """
+    if date_col not in df.columns:
+        raise ValueError(f"Date column '{date_col}' not found in dataframe")
+    if value_col not in df.columns:
+        raise ValueError(f"Value column '{value_col}' not found in dataframe")
+
+    prepared_df = df.copy()
+
+    # Convert date column to datetime if not already
+    if not pd.api.types.is_datetime64_any_dtype(prepared_df[date_col]):
+        try:
+            prepared_df[date_col] = pd.to_datetime(prepared_df[date_col], errors='raise')
+        except Exception as e:
+            raise ValueError(f"Cannot convert '{date_col}' to datetime: {e}")
+
+    # Sort by date
+    prepared_df = prepared_df.sort_values(date_col).reset_index(drop=True)
+
+    # Check for numeric value column
+    if not pd.api.types.is_numeric_dtype(prepared_df[value_col]):
+        raise ValueError(f"Value column '{value_col}' must be numeric for anomaly detection")
+
+    message = f"Data prepared: {len(prepared_df)} rows, sorted by {date_col}"
+    return prepared_df, message
