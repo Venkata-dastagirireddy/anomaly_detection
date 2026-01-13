@@ -615,3 +615,131 @@ def app():
             lags = st.slider("Lags", 5, 50, 20, key="acf_lags")
             fig_acf = plot_acf_pacf(prepared_df, value_col, lags=lags)
             st.plotly_chart(fig_acf, use_container_width=True)
+
+    st.divider()
+
+    # Impute Anomalies Section
+    st.subheader(":material/handyman: Impute Detected Anomalies")
+    
+    with st.container(border=True):
+        st.write("Replace detected anomalies with imputed values using various methods.")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            impute_method = st.selectbox(
+                "Select Imputation Method",
+                options=["Mean", "Median", "Linear Interpolation", "Forward Fill", "Backward Fill", "Spline Interpolation", "Mode"],
+                help="Choose how to impute anomalies"
+            )
+        
+        with col2:
+            # Show anomaly count
+            anomaly_count = sum(anomalies)
+            st.metric("Anomalies to Impute", anomaly_count)
+        
+        # Method-specific parameters
+        impute_params = {}
+        
+        if impute_method == "Spline Interpolation":
+            impute_params['order'] = st.slider("Spline Order", 1, 5, 3, key="spline_order")
+        elif impute_method == "Linear Interpolation":
+            impute_params['limit_direction'] = st.selectbox("Limit Direction", ["forward", "backward", "both"], key="limit_dir")
+        
+        if st.button("Impute Anomalies", type="primary", key="impute_anomalies_btn"):
+            try:
+                with st.spinner(f"Imputing anomalies using {impute_method}..."):
+                    imputed_df = prepared_df.copy()
+                    anomaly_indices = [i for i, is_anom in enumerate(anomalies) if is_anom]
+                    
+                    if impute_method == "Mean":
+                        fill_value = imputed_df[value_col].mean()
+                        imputed_df.loc[anomaly_indices, value_col] = fill_value
+                    
+                    elif impute_method == "Median":
+                        fill_value = imputed_df[value_col].median()
+                        imputed_df.loc[anomaly_indices, value_col] = fill_value
+                    
+                    elif impute_method == "Mode":
+                        fill_value = imputed_df[value_col].mode()[0] if len(imputed_df[value_col].mode()) > 0 else imputed_df[value_col].mean()
+                        imputed_df.loc[anomaly_indices, value_col] = fill_value
+                    
+                    elif impute_method == "Linear Interpolation":
+                        imputed_df[value_col] = imputed_df[value_col].interpolate(method='linear', limit_direction=impute_params.get('limit_direction', 'both'))
+                    
+                    elif impute_method == "Forward Fill":
+                        imputed_df[value_col] = imputed_df[value_col].fillna(method='ffill')
+                    
+                    elif impute_method == "Backward Fill":
+                        imputed_df[value_col] = imputed_df[value_col].fillna(method='bfill')
+                    
+                    elif impute_method == "Spline Interpolation":
+                        order = impute_params.get('order', 3)
+                        imputed_df[value_col] = imputed_df[value_col].interpolate(method='spline', order=order)
+                    
+                    # Store imputed data
+                    st.session_state['imputed_df'] = imputed_df
+                    st.session_state['impute_method_used'] = impute_method
+                    
+                    st.success(f"✅ Imputed {anomaly_count} anomalies using {impute_method}")
+                    
+            except Exception as e:
+                st.error(f"Failed to impute anomalies: {e}")
+    
+    # Show comparison if imputation was done
+    if 'imputed_df' in st.session_state:
+        st.divider()
+        st.subheader(":material/compare: Before & After Imputation Comparison")
+        
+        with st.container(border=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**Original Data (with anomalies)**")
+                st.dataframe(prepared_df[[date_col, value_col]].head(20), use_container_width=True)
+            
+            with col2:
+                st.write(f"**Imputed Data (using {st.session_state['impute_method_used']})**")
+                st.dataframe(st.session_state['imputed_df'][[date_col, value_col]].head(20), use_container_width=True)
+        
+        # Statistics comparison
+        st.subheader("Statistical Comparison")
+        
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        
+        with col1:
+            orig_mean = prepared_df[value_col].mean()
+            imputed_mean = st.session_state['imputed_df'][value_col].mean()
+            st.metric("Mean (Original)", f"{orig_mean:.2f}", f"{imputed_mean - orig_mean:.2f}")
+        
+        with col2:
+            orig_median = prepared_df[value_col].median()
+            imputed_median = st.session_state['imputed_df'][value_col].median()
+            st.metric("Median (Original)", f"{orig_median:.2f}", f"{imputed_median - orig_median:.2f}")
+        
+        with col3:
+            orig_std = prepared_df[value_col].std()
+            imputed_std = st.session_state['imputed_df'][value_col].std()
+            st.metric("Std Dev (Original)", f"{orig_std:.2f}", f"{imputed_std - orig_std:.2f}")
+        
+        with col4:
+            orig_min = prepared_df[value_col].min()
+            imputed_min = st.session_state['imputed_df'][value_col].min()
+            st.metric("Min (Original)", f"{orig_min:.2f}", f"{imputed_min - orig_min:.2f}")
+        
+        with col5:
+            orig_max = prepared_df[value_col].max()
+            imputed_max = st.session_state['imputed_df'][value_col].max()
+            st.metric("Max (Original)", f"{orig_max:.2f}", f"{imputed_max - orig_max:.2f}")
+        
+        with col6:
+            st.metric("Method Used", st.session_state['impute_method_used'])
+        
+        # Download imputed data
+        st.divider()
+        if st.button("📥 Add Imputed Column to Dataset"):
+            working_df = st.session_state["working_df"].copy()
+            # Merge imputed values back
+            working_df[f'{value_col}_imputed'] = st.session_state['imputed_df'][value_col].values
+            _safe_set_working(working_df, f"Added '{value_col}_imputed' column with {st.session_state['impute_method_used']} imputation")
+            st.rerun()
